@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- home_panel: Home Assistant on a home network is usually plain http (http://homeassistant.local:8123). The
+     launcher makes no other network requests, so allowing cleartext only affects the optional panel. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
