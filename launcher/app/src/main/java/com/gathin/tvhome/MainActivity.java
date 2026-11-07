@@ -202,6 +202,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private TextView raceKicker, raceHeadline, raceSessions;
     /** game_day: each team's next game from an add-on, rotating in the race panel; null when the key is off. */
     private GameDay gameDay;
+    /** home_panel (config.json): live camera and Home Assistant weather behind Home; null when off. */
+    private HomePanel homePanel;
     private View raceBar;
     private LinearLayout racePager;
     private long rotationStart;
@@ -784,6 +786,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             });
         }
 
+        // home_panel: built only when the theme enables it, so without it Home is unchanged.
+        homePanel = HomePanel.create(this, root, sky, grid, findViewById(R.id.leftBlock), findViewById(R.id.topButtons));
+
         // Liquid feel: soft springs on the highlight's position.
         springX = new SpringAnimation(glass, new FloatPropertyCompat<View>("glassContentX") {
             @Override
@@ -1140,6 +1145,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (gameDay != null) gameDay.start();
         sky.update();
         wallpaperPlayer.start();
+        // onActivityResult schedules recreate() and then onResume still runs on this instance. Starting the
+        // stream here would open a player that onDestroy immediately releases. The new Home starts its own.
+        if (homePanel != null && !settingsRecreationPending) homePanel.start();
         handler.postDelayed(minuteTick, MINUTE_MS);
         if (festive && lamp != null) {
             lamp.start();
@@ -1314,6 +1322,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         root.removeCallbacks(showIdleClock);
         endReorder();   // Home or another app while reordering keeps the order so far
         wallpaperPlayer.stop();
+        if (homePanel != null) homePanel.stop();   // no stream or polling while Home is not visible
         stopAmbientAnimation();
         hero.animate().cancel();
         ambient.animate().cancel();
@@ -1362,6 +1371,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         heroArtCache.clear();
         heroArtKey = null;
         wallpaperPlayer.releaseForMemoryPressure();
+        if (homePanel != null) homePanel.trimMemory();
         tileRefresh.invalidate();
     }
 
@@ -1388,6 +1398,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         super.onDestroy();
         ViewTreeObserver tree = getWindow().getDecorView().getViewTreeObserver();
         if (tree.isAlive()) tree.removeOnGlobalFocusChangeListener(glassFocusListener);
+        // Drop the player and the panel threads before later cleanup can throw. recreate() runs this
+        // onDestroy to the end before the next Home's onCreate, so only one panel is ever attached.
+        if (homePanel != null) {
+            homePanel.destroy();
+            homePanel = null;
+        }
         RemoteKeys.release(this);
         cancelHoldOk();
         if (gameDay != null) gameDay.shutdown();
