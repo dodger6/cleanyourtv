@@ -20,11 +20,13 @@ dropped the connection,
 number of words, a local path that cannot be used, a port it could not open, or a TV_HOST that is a URL
 or a path instead of the TV's address. A flag and its count are
 judged before TV_HOST is read, so a typo names the usage instead of the TV's address.
+Batch input must be UTF-8 without NUL bytes; the whole list is checked before connecting.
 
 Set TV_ADB_BINARY to the Google adb executable to use an already connected, paired transport
 (including encrypted Wireless debugging). See tools/native-adb.md.
 """
 import errno
+import io
 import os
 import re
 import shutil
@@ -261,6 +263,8 @@ class NativeAdbDevice:
     # b64push sizes its shell commands from this payload bound. A small value also
     # keeps adb's command-line arguments below Windows' process argument limit.
     max_chunk_size = 4096
+    # A shell OPEN also carries the service prefix and its terminating NUL.
+    max_shell_command_size = max_chunk_size - len(b"shell:\0")
 
     def __init__(self, binary, host, port, timeout):
         self.binary = binary
@@ -752,6 +756,29 @@ def push(dev, local, remote):
 def main():
     args = sys.argv[1:]
     check_arity(args)
+    batch_lines = None
+    if args and args[0] == "--batch":
+        # The whole list is decoded before the TV is contacted, so a bad byte refuses the run instead of
+        # stopping it half way. utf-8-sig drops the BOM Windows PowerShell may prepend to piped stdin.
+        raw = sys.stdin.buffer.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as e:
+            # e.start counts from after a BOM; a lone CR ends a line too, as it does in the loop below.
+            head = raw[:e.start + (3 if raw.startswith(b"\xef\xbb\xbf") else 0)]
+            bad_line = head.replace(b"\r\n", b"\n").replace(b"\r", b"\n").count(b"\n") + 1
+            print(f"--batch: line {bad_line} of the list is not UTF-8; nothing was sent to the TV. "
+                  f"Save the file as UTF-8 and run it again.", file=sys.stderr)
+            return 2
+        # NUL is valid UTF-8 but cannot be passed as a command argument to native ADB. In particular,
+        # BOM-less UTF-16 made from ASCII commands decodes as UTF-8 with NULs between the letters.
+        if "\0" in text:
+            head = text.split("\0", 1)[0]
+            bad_line = head.replace("\r\n", "\n").replace("\r", "\n").count("\n") + 1
+            print(f"--batch: line {bad_line} of the list contains a NUL byte; nothing was sent to the TV. "
+                  "Check the file encoding and save it as UTF-8 without NUL bytes.", file=sys.stderr)
+            return 2
+        batch_lines = io.StringIO(text, newline=None)
     try:
         dev = connect()
     except Exception as e:
@@ -773,20 +800,33 @@ def main():
         for p in ("ro.product.model", "ro.product.device", "ro.build.version.release",
                   "ro.build.version.sdk", "ro.build.display.id", "ro.product.manufacturer",
                   "ro.adb.secure", "service.adb.tcp.port"):
-            print(f"{p} = {dev.shell(f'getprop {p}').strip()}")
+            try:
+                got = dev.shell(f'getprop {p}').strip()
+            except Exception as e:
+                why = lost_connection(e, f"getprop {p}")
+                if why is None:
+                    raise
+                print(why, file=sys.stderr)
+                return 1
+            print(f"{p} = {got}")
     elif args[0] == "--screenshot":
         local, keys, wait = screenshot_args(args[1:])
-        status = screenshot(dev, local, keys, wait)
+        try:
+            status = screenshot(dev, local, keys, wait)
+        except Exception as e:
+            why = lost_connection(e, " ".join(args))
+            if why is None:
+                raise
+            print(why, file=sys.stderr)
+            return 1
     elif args[0] == "--push" and len(args) == 3:
         status = push(dev, args[1], args[2])
     elif args[0] == "--pull" and len(args) == 3:
         status = pull(dev, args[1], args[2])
     elif args[0] == "--batch":
         # one shell command per stdin line, each run separately on the same connection.
-        # utf-8-sig drops the BOM Windows PowerShell may prepend to piped stdin.
-        sys.stdin.reconfigure(encoding="utf-8-sig")
         sent = 0
-        for line in sys.stdin:
+        for line in batch_lines:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue

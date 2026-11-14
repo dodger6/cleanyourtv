@@ -14,6 +14,7 @@ disable.sh refuses as one of Android's core packages (#884) is marked `never`, w
 
 It reads files only: no TV, no ADB client, nothing written. It ranks nothing and suggests no list; the
 counts are what the lists say, not a verdict for this TV.
+Package files may be UTF-8 (with or without a BOM), or BOM-marked UTF-16 as Windows PowerShell writes.
 
 Exit codes: 0 the table was printed, 2 the packages file, the examples folder or a list in it could not
 be read.
@@ -37,9 +38,12 @@ def read_packages(path):
     name on its own line is taken too, so a hand-trimmed file works.
     """
     try:
-        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+        data = Path(path).read_bytes()
     except OSError as e:
         raise SystemExit(f"could not read {path} ({e.strerror or e}): pass a saved `pm list packages`")
+    # PowerShell 5.1 redirection writes UTF-16; its BOM identifies the byte order.
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    text = data.decode(encoding, errors="replace")
     names = set()
     for line in text.splitlines():
         line = line.strip()
@@ -82,7 +86,19 @@ def tally(packages, examples):
     """{package: (disabled, commented, most common note)} over every examples/*/debloat*.txt."""
     # The same discovery tests/test_examples.py and tests/test_stock_launcher_undo.py sweep with: a folder
     # may ship a second list beside debloat.txt, and tools/disable.sh takes it like the first.
-    lists = sorted(Path(examples).glob("*/debloat*.txt"))
+    # glob() suppresses directory read errors, which would silently produce a partial tally.
+    lists = []
+    root = Path(examples)
+    try:
+        with os.scandir(root) as folders:
+            for folder in folders:
+                if folder.is_dir():
+                    with os.scandir(folder.path) as entries:
+                        lists.extend(Path(entry.path) for entry in entries
+                                     if Path(entry.name).match("debloat*.txt"))
+    except OSError as e:
+        raise SystemExit(f"could not read {e.filename or examples} ({e.strerror or e}): no counts printed")
+    lists.sort()
     if not lists:
         raise SystemExit(f"{examples}: no */debloat*.txt lists in it")
     wanted = set(packages)
@@ -110,6 +126,12 @@ def tally(packages, examples):
 
 
 def main(argv=None):
+    # A console code page such as cp1252 cannot print every note; print a replacement character instead of stopping.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(
         description="For each package in a saved `pm list packages`, how many tested lists in examples/ "
                     "disable it or keep it commented out. Reads files only.")

@@ -16,9 +16,16 @@ TCP with the adb_shell library, so no adb binary is needed. That matters on macO
 platform tools are not installed by default.
 
 Usage:
-    TV_HOST=192.168.1.50 python tools/bench.py --keys 36 --series 3
-    TV_HOST=192.168.1.50 python tools/bench.py --keys 36 --series 3 --out-dir my-results
-    TV_HOST=192.168.1.50 python tools/bench.py --app org.videolan.vlc/.StartActivity
+    TV_HOST=192.168.1.50 tools/venv/bin/python -I tools/bench.py --keys 36 --series 3
+    TV_HOST=192.168.1.50 tools/venv/bin/python -I tools/bench.py --keys 36 --series 3 --out-dir my-results
+    TV_HOST=192.168.1.50 tools/venv/bin/python -I tools/bench.py --app org.videolan.vlc/.StartActivity
+
+The venv's Python is the one tools/requirements.txt installs adb_shell into, and the lines above name
+it rather than a bare `python`. Started with another Python this script runs again under the venv's
+one, which rescues the packages but not the name of the interpreter - `python` on its own is a command
+neither a stock Ubuntu 24.04 nor macOS has, so the line it used to print answered `command not found`
+(exit 127) before anything was read. docs/workflows/perf-ab.md and the other tools' headers already
+name the venv this way.
 
 --app names the app the cold start and the return to Home leave Home for. Without it, the TV's
 Settings, else the first leanback app that is not the launcher.
@@ -147,20 +154,25 @@ class TV:
                 raise SystemExit(2) from error
         return self.client
 
-    def shell(self, command):
+    def shell(self, command, *, retry=False):
         """Run one shell command on the TV and return its output; bytes that aren't UTF-8 become U+FFFD.
 
-        A dropped connection (the TV went to standby for a moment) is reopened once.
+        A connection failure before submission is retried once. After a command is attempted,
+        only queries explicitly marked retry=True may be replayed: a missing response does not
+        mean the TV did not execute the command.
         """
         for attempt in (1, 2):
+            command_started = False
             try:
-                out = self._connect().shell(command, read_timeout_s=120.0, decode=False)
+                client = self._connect()
+                command_started = True
+                out = client.shell(command, read_timeout_s=120.0, decode=False)
                 return out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
             except SystemExit:
                 raise
             except Exception:
                 self.close()
-                if attempt == 2:
+                if attempt == 2 or (command_started and not retry):
                     raise
 
     def close(self):
@@ -178,7 +190,7 @@ class TV:
         """The component that answers HOME, e.g. com.gathin.tvhome/.MainActivity."""
         out = self.shell(
             "cmd package resolve-activity --brief -a android.intent.action.MAIN "
-            "-c android.intent.category.HOME")
+            "-c android.intent.category.HOME", retry=True)
         lines = [line.strip() for line in out.splitlines() if "/" in line]
         return lines[-1] if lines else None
 
@@ -188,7 +200,7 @@ class TV:
         The dump has several "mCurrentFocus"/"mFocusedApp" lines; only the one that names a
         window counts, and a popup (a menu left open) is a window of its own.
         """
-        out = self.shell("dumpsys window")
+        out = self.shell("dumpsys window", retry=True)
         for line in out.splitlines():
             match = re.search(r"mCurrentFocus=Window\{[^}]*\s(\S+?)\}", line)
             if match:
@@ -209,7 +221,7 @@ class TV:
         return component.split("/", 1)[0]
 
     def version_of(self, package):
-        out = self.shell(f"dumpsys package {package}")
+        out = self.shell(f"dumpsys package {package}", retry=True)
         match = re.search(r"versionName=(\S+)", out)
         return match.group(1) if match else "?"
 
@@ -243,7 +255,7 @@ def key_event_time(tv, keycode, binary=None):
     state = vars(tv).setdefault("_key_log", {"seen": False, "misses": 0})
     if not state["seen"] and state["misses"] >= KEY_LOG_PROBES:
         return None
-    out = tv.shell("logcat -d -b main -t 2000 | grep injectKeyEvent")
+    out = tv.shell("logcat -d -b main -t 2000 | grep injectKeyEvent", retry=True)
     name = KEYCODE_NAMES.get(keycode, f"keyCode={keycode}")
     for line in reversed(out.splitlines()):
         if "injectKeyEvent" in line and "action=ACTION_DOWN" in line and name in line:
@@ -261,7 +273,7 @@ def android_uptime(tv, package=None, binary=None):
     clock: it counts the time the device spent suspended, so it runs hours ahead of the frames.
     """
     what = f"dumpsys gfxinfo {package}" if package else "dumpsys gfxinfo"
-    out = tv.shell(what)
+    out = tv.shell(what, retry=True)
     match = re.search(r"^Uptime:\s*(\d+)", out, re.M)
     return int(match.group(1)) if match else None
 
@@ -278,7 +290,7 @@ def measure_key(tv, keycode, binary=None, package=None):
         t_before = int(match.group(1))
     tv.shell(f"input keyevent {keycode}")
     time.sleep(1.0)
-    stats = tv.shell(f"dumpsys gfxinfo {package} framestats")
+    stats = tv.shell(f"dumpsys gfxinfo {package} framestats", retry=True)
     t_after = None
     match = re.search(r"^Uptime:\s*(\d+)", stats, re.M)
     if match:
@@ -292,7 +304,9 @@ def measure_key(tv, keycode, binary=None, package=None):
         t0 = t_before
     if t0 is None:
         return None
-    rows = frame_rows(stats)
+    # gfxinfo emits a PROFILEDATA block per window, not one global timeline.
+    # Pick the first completion and movement gap in time order across those blocks.
+    rows = sorted(frame_rows(stats), key=lambda row: row[2])
     threshold = t0 * 1_000_000
     first = last = prev = None
     for flags, intended, completed in rows:
@@ -303,7 +317,7 @@ def measure_key(tv, keycode, binary=None, package=None):
             continue
         if (intended - prev) / 1e6 > 50:      # a gap: the movement is over
             break
-        last, prev = completed, intended
+        last, prev = completed, max(prev, intended)
     if first is None:
         return None
     # A key that moves nothing (the end of a row, the focus on the top bar) leaves the next
@@ -366,9 +380,10 @@ def other_app(tv):
     if tv._other_app:
         return tv._other_app
     launcher = tv.package_of(tv.home_component() or "")
-    candidates = tv.shell("cmd package resolve-activity --brief -a android.settings.SETTINGS").splitlines()
+    candidates = tv.shell(
+        "cmd package resolve-activity --brief -a android.settings.SETTINGS", retry=True).splitlines()
     candidates += tv.shell("cmd package query-activities --brief -a android.intent.action.MAIN "
-                           "-c android.intent.category.LEANBACK_LAUNCHER").splitlines()
+                           "-c android.intent.category.LEANBACK_LAUNCHER", retry=True).splitlines()
     for line in candidates:
         line = line.strip()
         if COMPONENT.match(line) and not line.startswith(("android/", launcher + "/")) \
@@ -380,7 +395,7 @@ def other_app(tv):
 
 def accessibility_services(tv, package):
     """The accessibility services enabled for a package, as the setting holds them."""
-    out = tv.shell("settings get secure enabled_accessibility_services")
+    out = tv.shell("settings get secure enabled_accessibility_services", retry=True)
     return [part.strip() for part in out.split(":") if part.strip().startswith(package + "/")]
 
 
@@ -409,7 +424,7 @@ def restore_accessibility(tv, package, services):
     """
     if not services:
         return
-    current = tv.shell("settings get secure enabled_accessibility_services").strip()
+    current = tv.shell("settings get secure enabled_accessibility_services", retry=True).strip()
     if current == "null":
         current = ""
     merged = [part for part in current.split(":") if part]
@@ -481,7 +496,7 @@ def return_to_home(tv, component, repeats):
         tv.shell("input keyevent 3")
         time.sleep(3)
         out = tv.shell("logcat -d -b main -b events -v epoch | grep -e injectKeyEvent "
-                       "-e am_on_resume_called -e wm_on_resume_called")
+                       "-e am_on_resume_called -e wm_on_resume_called", retry=True)
         key_at = resume_at = None
         for line in out.splitlines():
             # The log indents its lines, so the timestamp is not at the start of the line.
@@ -505,7 +520,7 @@ def return_to_home(tv, component, repeats):
 
 def launcher_pid(tv, package):
     """The pid of the launcher process, or None."""
-    out = tv.shell(f"pidof {package}").strip()
+    out = tv.shell(f"pidof {package}", retry=True).strip()
     if not out:
         return None
     return out.split()[0]
@@ -514,13 +529,14 @@ def launcher_pid(tv, package):
 def idle_cpu(tv, package, seconds):
     """The CPU of the whole device and of the launcher, over `seconds`, from /proc/stat."""
     def sample():
-        return tv.shell("head -1 /proc/stat; cat /proc/[0-9]*/stat 2>/dev/null").splitlines()
+        return tv.shell("head -1 /proc/stat; cat /proc/[0-9]*/stat 2>/dev/null", retry=True).splitlines()
 
     def parse(lines):
         for line in lines:
             if line.startswith("cpu "):
                 fields = [int(x) for x in line.split()[1:]]
-                return (sum(fields), fields[3] + fields[4])
+                # guest and guest_nice are already included in user and nice.
+                return (sum(fields[:8]), fields[3] + fields[4])
         return None
 
     def process_ticks(lines, pid):
@@ -555,7 +571,7 @@ def idle_cpu(tv, package, seconds):
 
 
 def pss_of(tv, package):
-    out = tv.shell(f"dumpsys meminfo {package}")
+    out = tv.shell(f"dumpsys meminfo {package}", retry=True)
     match = re.search(r"^\s*TOTAL(?: PSS)?:\s+(\d+)\b", out, re.M)
     return int(match.group(1)) // 1024 if match else None
 
@@ -773,10 +789,10 @@ def main():
         "launcher": component, "version": version, "package": package,
         "host": args.host,
         "environment": {
-            "android_release": tv.shell("getprop ro.build.version.release").strip(),
-            "sdk": tv.shell("getprop ro.build.version.sdk").strip(),
-            "model": tv.shell("getprop ro.product.model").strip(),
-            "fingerprint": tv.shell("getprop ro.build.fingerprint").strip(),
+            "android_release": tv.shell("getprop ro.build.version.release", retry=True).strip(),
+            "sdk": tv.shell("getprop ro.build.version.sdk", retry=True).strip(),
+            "model": tv.shell("getprop ro.product.model", retry=True).strip(),
+            "fingerprint": tv.shell("getprop ro.build.fingerprint", retry=True).strip(),
         },
         "keys": {"series": args.series, "per_series": args.keys,
                  "measured": len(measured), "lost": len(samples) - len(measured)},

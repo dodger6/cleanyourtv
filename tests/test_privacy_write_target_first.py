@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -169,13 +170,16 @@ class PrivacyWriteTargetTest(unittest.TestCase):
         self.state_path.write_text(json.dumps(state))
 
     def write(self, target, *args, hook=None):
-        env = dict(os.environ, TV_HOST="192.168.1.50", FAKE_TV_STATE=str(self.state_path))
+        # The fake tv.py does not reconfigure the streams as the real one does, so name UTF-8 for the
+        # Unicode paths of the test below; a Windows pipe would otherwise use the ANSI code page.
+        env = dict(os.environ, TV_HOST="192.168.1.50", FAKE_TV_STATE=str(self.state_path),
+                   PYTHONIOENCODING="utf-8")
         command = [sys.executable, str(self.script), "--write", str(target), *args]
         if hook:
             env.update(PRIVACY_WRITE_HOOK=hook, PRIVACY_SENTINEL=SENTINEL.hex())
             command = [sys.executable, "-c", WRITE_HOOK, *command[1:]]
         return subprocess.run(command,
-                              cwd=self.repo, env=env, capture_output=True, text=True,
+                              cwd=self.repo, env=env, capture_output=True, text=True, encoding="utf-8",
                               stdin=subprocess.DEVNULL, timeout=120)
 
     def symlink(self, link, target):
@@ -345,8 +349,10 @@ class PrivacyWriteTargetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertIn(f"wrote 1 packages to {target}", result.stdout)
-        self.assertIn(f"tools/disable.sh {target}", result.stdout)
-        self.assertIn(f"tools/restore.sh {target}", result.stdout)
+        for label, script in (("apply:", "tools/disable.sh"), ("undo:", "tools/restore.sh")):
+            command = next(line.split(":", 1)[1] for line in result.stdout.splitlines()
+                           if line.startswith(label))
+            self.assertEqual(shlex.split(command)[1:], [script, str(target)])
         self.assertEqual(target.read_bytes(), normal.read_bytes())
         self.assertEqual(recovery.read_list(target), [KATNISS])
         ordinary = folder / "ordinary.txt"

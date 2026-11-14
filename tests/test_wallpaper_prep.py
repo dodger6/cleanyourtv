@@ -1,8 +1,11 @@
 """tools/wallpaper_prep.py: size, darkening, numbering, the size limit and the refusals."""
 import importlib.util
+import contextlib
+import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +91,79 @@ class OverlapTest(unittest.TestCase):
 
 @unittest.skipIf(Image is None, "Pillow not installed")
 class PrepareTest(unittest.TestCase):
+    def test_cleanup_failure_after_replace_still_counts_the_picture(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d, "photos"), Path(d, "out")
+            src.mkdir()
+            make_photo(src / "a.png")
+            cleanup = tempfile.TemporaryDirectory.cleanup
+
+            def cleanup_then_fail(stage):
+                cleanup(stage)
+                raise PermissionError("injected cleanup failure")
+
+            err, output = io.StringIO(), io.StringIO()
+            with mock.patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup_then_fail), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(output):
+                self.assertEqual(prep.main([str(src), str(out), "--size", "32x18"]), 0)
+            with Image.open(out / "01.jpg") as image:
+                self.assertEqual(image.size, (32, 18))
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("1 of 1 pictures written", output.getvalue())
+
+    def test_failed_encoder_keeps_previous_output_and_cleans_stage(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d, "in.png"), Path(d, "out.jpg")
+            make_photo(src)
+            out.write_bytes(b"previous wallpaper")
+
+            def fail_save(image, path, *args, **kwargs):
+                Path(path).write_bytes(b"partial JPEG")
+                raise OSError(28, "No space left on device")
+
+            with mock.patch.object(Image.Image, "save", fail_save), self.assertRaises(OSError):
+                prep.prepare(str(src), str(out), (32, 18), 1, 0, 84, 300)
+            self.assertEqual(out.read_bytes(), b"previous wallpaper")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["in.png", "out.jpg"])
+
+    def test_failed_replace_keeps_previous_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d, "in.png"), Path(d, "out.jpg")
+            make_photo(src)
+            out.write_bytes(b"previous wallpaper")
+            with mock.patch.object(prep.os, "replace", side_effect=PermissionError("busy")), \
+                    self.assertRaises(PermissionError):
+                prep.prepare(str(src), str(out), (32, 18), 1, 0, 84, 300)
+            self.assertEqual(out.read_bytes(), b"previous wallpaper")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["in.png", "out.jpg"])
+
+    def test_success_preserves_symlink_and_target_permissions(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, target, out = Path(d, "in.png"), Path(d, "target.jpg"), Path(d, "out.jpg")
+            make_photo(src)
+            target.write_bytes(b"old")
+            target.chmod(0o640)
+            try:
+                out.symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not available here")
+            prep.prepare(str(src), str(out), (32, 18), 1, 0, 84, 300)
+            self.assertTrue(out.is_symlink())
+            with Image.open(target) as image:
+                self.assertEqual(image.size, (32, 18))
+            if os.name == "posix":
+                self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+
+    def test_failed_new_output_leaves_no_partial_picture(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d, "in.png"), Path(d, "out.jpg")
+            make_photo(src)
+            with mock.patch.object(Image.Image, "save", side_effect=OSError("encoder failed")), \
+                    self.assertRaises(OSError):
+                prep.prepare(str(src), str(out), (32, 18), 1, 0, 84, 300)
+            self.assertFalse(out.exists())
+            self.assertEqual(list(Path(d).iterdir()), [src])
+
     def test_output_is_1280x720_jpeg_and_darker(self):
         with tempfile.TemporaryDirectory() as d:
             src, out = Path(d, "in.png"), Path(d, "out.jpg")
@@ -126,6 +202,30 @@ class PrepareTest(unittest.TestCase):
             make_photo(Path(d, "a.png"))
             with self.assertRaises(SystemExit):
                 prep.main([d, d])
+
+    def test_a_target_that_is_a_file_is_refused_in_words(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "photos")
+            src.mkdir()
+            make_photo(src / "01.jpg", size=(320, 240))
+            target = Path(d, "out.txt")
+            target.write_text("keep")
+            with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(io.StringIO()) as err:
+                prep.main([str(src), str(target)])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("is a file, not a folder", err.getvalue())
+            self.assertEqual(target.read_text(), "keep")
+
+    def test_a_target_under_a_file_is_named_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "photos")
+            src.mkdir()
+            make_photo(src / "01.jpg", size=(320, 240))
+            Path(d, "out.txt").write_text("keep")
+            with self.assertRaises(SystemExit) as caught:
+                prep.main([str(src), str(Path(d, "out.txt", "sub"))])
+            self.assertIn("cannot create the folder", str(caught.exception.code))
+            self.assertIn("Nothing was written", str(caught.exception.code))
 
     def test_target_reached_through_a_symlink_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
@@ -179,6 +279,50 @@ class PrepareTest(unittest.TestCase):
             make_photo(Path(d, "a.png"))
             with self.assertRaises(SystemExit):
                 prep.main([d, str(Path(d, "out"))])
+
+    def test_case_aliased_descendants_are_refused_without_changing_the_source_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, alias = Path(d, "photos"), Path(d, "PHOTOS")
+            src.mkdir()
+            if not alias.is_dir():
+                self.skipTest("this filesystem is case-sensitive")
+            make_photo(src / "a.png", size=(32, 18))
+
+            def snapshot():
+                return {str(p.relative_to(src)): None if p.is_dir() else p.read_bytes()
+                        for p in src.rglob("*")}
+
+            for reversed_case in (False, True):
+                for existing in (False, True):
+                    with self.subTest(reversed_case=reversed_case, existing=existing):
+                        source, target_root = (alias, src) if reversed_case else (src, alias)
+                        target = target_root / f"album-{reversed_case}-{existing}" / "output"
+                        if existing:
+                            target.mkdir(parents=True)
+                            make_photo(target / "01.jpg", size=(32, 18), colour=(10, 20, 30))
+                        before = snapshot()
+                        with mock.patch.object(prep, "prepare", wraps=prep.prepare) as convert, \
+                                contextlib.redirect_stderr(io.StringIO()), \
+                                contextlib.redirect_stdout(io.StringIO()), \
+                                self.assertRaises(SystemExit) as caught:
+                            prep.main([str(source), str(target), "--size", "32x18"])
+                        self.assertEqual(caught.exception.code, 2)
+                        convert.assert_not_called()
+                        self.assertEqual(snapshot(), before)
+
+    def test_a_separate_prefix_sibling_or_missing_external_tree_still_converts(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "photos")
+            src.mkdir()
+            make_photo(src / "a.png", size=(32, 18))
+            original = (src / "a.png").read_bytes()
+            for target in (Path(d, "PHOTOS-output"), Path(d, "elsewhere", "nested", "output")):
+                with self.subTest(target=target):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(prep.main([str(src), str(target), "--size", "32x18"]), 0)
+                    with Image.open(target / "01.jpg") as image:
+                        self.assertEqual((image.format, image.size), ("JPEG", (32, 18)))
+                    self.assertEqual((src / "a.png").read_bytes(), original)
 
     def test_main_numbers_the_outputs_and_skips_a_corrupt_file(self):
         with tempfile.TemporaryDirectory() as d:

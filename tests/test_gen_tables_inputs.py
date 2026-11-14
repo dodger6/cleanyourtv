@@ -43,6 +43,33 @@ def valid(tmp):
     return tree(tmp, [("tcl-a", tv("TCL A", "TCL")), ("sony-b", tv("Sony B", "Sony"))])
 
 
+class FontTest(unittest.TestCase):
+    def test_an_empty_font_is_refused_before_writing_tables_or_adopting_metadata(self):
+        # An unset shell variable in --font "$FONT" is an explicit unusable path, not an omitted option.
+        for mode in ("rewrite", "check", "adopt"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = valid(tmp)
+                args = ["--root", str(root), "--font", ""]
+                if mode == "adopt":
+                    add(root, "tcl-d", None)
+                    patch = root / "pr.diff"
+                    patch.write_text("| `tcl-d/` | TCL D | Android TV 11 | ads off |\n", encoding="utf-8")
+                    args += ["--adopt", str(patch)]
+                else:
+                    add(root, "tcl-c", tv("TCL C", "TCL"))
+                    if mode == "check":
+                        args += ["--check"]
+                before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                code, out, err = run(*args, cwd=root)
+                after = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                self.assertEqual(after, before, "a refused font must not publish tables or metadata")
+                self.assertEqual(code, 2, err)
+                self.assertEqual(out, "")
+                self.assertIn("font", err)
+                self.assertIn("''", err)
+                self.assertNotIn("Traceback", err)
+
+
 class RootTest(unittest.TestCase):
     def test_a_root_that_is_not_a_folder_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,6 +173,44 @@ class AdoptTest(unittest.TestCase):
             self.assertIn("cannot read ''", err)
             self.assertIn("Nothing was written", err)
             self.assertEqual(out, "")
+
+    ROW = "| `tcl-x/` | TCL X | Android TV 11 | notes |"
+
+    def adopted(self, tmp, payload):
+        """(exit status, stdout, stderr, tv.json path, README.md bytes before) of --adopt on a patch holding these bytes."""
+        root = valid(tmp)
+        add(root, "tcl-x", None)
+        before = (root / "README.md").read_bytes()
+        patch = Path(tmp) / "pr.diff"
+        patch.write_bytes(payload)
+        code, out, err = run("--root", str(root), "--adopt", str(patch))
+        return code, out, err, root / "examples" / "tcl-x" / "tv.json", before
+
+    def test_a_utf16_patch_is_adopted_like_a_utf8_one(self):
+        # Windows PowerShell 5.1 `gh pr diff N > pr.diff` writes UTF-16LE with a BOM.
+        diff = f"diff --git a/examples/README.md b/examples/README.md\n@@ -1,1 +1,2 @@\n+{self.ROW}\n"
+        for name, payload in (("utf-16-le", diff.encode("utf-16")), ("utf-16-be", b"\xfe\xff" + diff.encode("utf-16-be"))):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                code, out, err, tv_json, _ = self.adopted(tmp, payload)
+                self.assertEqual(code, 0, err + out)
+                self.assertEqual(json.loads(tv_json.read_text(encoding="utf-8"))["tv"], "TCL X")
+
+    def test_a_utf8_bom_does_not_drop_the_first_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err, tv_json, _ = self.adopted(tmp, b"\xef\xbb\xbf" + f"+{self.ROW}\n".encode("utf-8"))
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(json.loads(tv_json.read_text(encoding="utf-8"))["tv"], "TCL X")
+
+    def test_a_patch_that_is_not_text_exits_2_and_writes_nothing(self):
+        for payload in (b"\x80\x81", b"\xff\x00\xd8"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                code, out, err, tv_json, before = self.adopted(tmp, payload)
+                self.assertEqual(code, 2, err)
+                self.assertIn("is not UTF-8 or UTF-16 text. Nothing was written.", err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(out, "")
+                self.assertFalse(tv_json.exists())
+                self.assertEqual((Path(tmp) / "README.md").read_bytes(), before)
 
     def test_the_root_is_judged_before_the_patch_is_applied(self):
         # A readable patch and a root with nothing of the repository in it: no tv.json may appear.
