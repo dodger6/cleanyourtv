@@ -36,11 +36,12 @@ stated when the translation landed while the card had moved on. Its coverage cla
 "inclui" rather than a colon, the one shape every other page uses, so the reader found nothing to cut the
 three numbers out of. Both are read here now, against README.md's alt text and docs/PRESS.md.
 
-README.he.md, added with the Hebrew translation (4af8a7ee), is the second page of that kind: a story
+README.he.md, added with the Hebrew translation (4af8a7ee), was the second page of that kind: a story
 section with the totals sentence and the coverage clause, and no card, so neither the alt-text walk nor the
 pt-BR name reached it. All five numbers it states - the tree's two totals and the press three - could go
-stale with the suite green. The pages are found by their paragraph now, so this page and any translation
-that copies the story are read without a name being added here.
+stale with the suite green. The pages are found by their paragraph now, so this page, README.uz.md (the
+third, which arrived with the Uzbek translation) and any translation that copies the story are read
+without a name being added here.
 
 Run from the repository root: python3 -m unittest discover -s tests -v
 """
@@ -76,14 +77,15 @@ VIDEO_LINK = re.compile(r"\((https?://[^)\s]*(?:youtube\.com|bilibili\.com)/[^)\
 CARD_ALT = re.compile(r'src="docs/card(?:-halloween)?\.jpg"[^>]*?alt="([^"]*)"')
 # The front pages that show the card and repeat its numbers in the story section today.
 STORY_PAGES = ("README.md", "README.de.md", "README.nl.md", "README.uk.md", "README.tr.md")
-# Two front pages carry the story paragraph without the card: README.pt-BR.md and README.he.md have
-# no docs/card.jpg, so card_alt_texts() never reaches them and none of the checks above read the
-# numbers they write. README.pt-BR.md said the totals README.md had when the translation landed (420
-# models, 108 brands) and its coverage clause opened with "inclui" rather than a colon, so
-# coverage_numbers() cut nothing out of it either; README.he.md was read by nothing at all, and a
-# stale pair there left every test green. A page is found by its paragraph, not added here by hand:
-# see story_pages().
-STORY_WITHOUT_CARD = ("README.he.md", "README.pt-BR.md")
+# Front pages that carry the story paragraph without the card: README.pt-BR.md, README.he.md and
+# README.uz.md have no docs/card.jpg, so card_alt_texts() never reaches them and none of the checks
+# above read the numbers they write. README.pt-BR.md said the totals README.md had when the
+# translation landed (420 models, 108 brands) and its coverage clause opened with "inclui" rather than
+# a colon, so coverage_numbers() cut nothing out of it either; README.he.md was read by nothing at all,
+# and a stale pair there left every test green. A page is found by its paragraph, not added here by
+# hand: see story_pages(). This tuple is the floor, the pages a copy of the story is expected to
+# keep - the walk below judges every page it finds, named here or not.
+STORY_WITHOUT_CARD = ("README.he.md", "README.pt-BR.md", "README.uz.md")
 # The story paragraph's closing sentence, which repeats the three numbers in prose: "The coverage: 351
 # articles from 46 countries and 229 videos on YouTube and Bilibili, all in [docs/PRESS.md](docs/PRESS.md)".
 # Every translation writes its own words around the numbers but keeps them in that order, so they are read

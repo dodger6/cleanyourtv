@@ -7,7 +7,10 @@ file or examples folder that cannot be used ends the run at 2 with one line, no 
 
 Run from the repository root: python3 -m unittest discover -s tests -v
 """
+import codecs
+import errno
 import io
+import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import subprocess
@@ -57,6 +60,32 @@ class ReadPackagesTest(MatchCase):
         path = self.base / "p.txt"
         path.write_bytes(b"\xef\xbb\xbfcom.example.first\r\n  com.example.second  \r\n")
         self.assertEqual(["com.example.first", "com.example.second"], match.read_packages(path))
+
+    def test_the_framework_package_is_read_even_though_it_has_no_dot(self):
+        # `pm list packages` prints the framework package as `package:android`, and -f as
+        # `package:/system/framework/framework-res.apk=android`; it is the one core package whose name
+        # has no dot, so skipping it would drop the `never` row the tool promises for every core package.
+        path = self.write("p.txt", "package:android\npackage:com.example.app\n")
+        self.assertEqual(["android", "com.example.app"], match.read_packages(path))
+        f_form = self.write("f.txt", "package:/system/framework/framework-res.apk=android\n")
+        self.assertEqual(["android"], match.read_packages(f_form))
+
+    def test_a_word_that_is_not_a_core_package_still_needs_a_dot(self):
+        # The bare-name allowance is the core list, not any word: a header a reader pasted in stays out.
+        path = self.write("p.txt", "Total packages: 3\nnot_a_package\npackages:\n"
+                                   "package:com.example.ok\n")
+        self.assertEqual(["com.example.ok"], match.read_packages(path))
+
+    def test_utf16_package_files_with_a_bom_are_read(self):
+        text = ("package:com.example.second\r\n"
+                "package:/system/app/Foo/base.apk=com.example.first\r\n"
+                "com.example.second\r\n")
+        for encoding, bom in (("utf-16-le", codecs.BOM_UTF16_LE),
+                              ("utf-16-be", codecs.BOM_UTF16_BE)):
+            with self.subTest(encoding=encoding):
+                path = self.base / "p.txt"
+                path.write_bytes(bom + text.encode(encoding))
+                self.assertEqual(["com.example.first", "com.example.second"], match.read_packages(path))
 
     def test_lines_that_are_not_package_names_are_skipped(self):
         path = self.write("p.txt", "error: device offline\n\npackage:com.example.ok\nnot_a_package\n"
@@ -223,6 +252,17 @@ class MainTest(MatchCase):
         self.assertEqual(["1", "0"], rows["com.example.ads"])
         self.assertEqual(["0", "0"], rows["com.android.providers.calendar"])
 
+    def test_the_framework_package_prints_as_never_in_the_table(self):
+        # The bare name is where the table used to go silent: the row was not shown at all, so a reader
+        # could not see that `android` is one of the packages disable.sh refuses.
+        self.add_list("a", "com.example.ads\n")
+        packages = self.write("p.txt", "package:android\npackage:com.example.ads\n")
+        code, out, err = self.run_main(str(packages), "--examples", str(self.examples))
+        self.assertEqual(0, code, err)
+        rows = {line.split()[0]: line.split()[1:] for line in out.splitlines()[1:]}
+        self.assertEqual(["never"], rows["android"])
+        self.assertIn("2 packages, counted over 1 lists", err)
+
     def test_columns_line_up_with_the_longest_name(self):
         self.add_list("a", "com.example.a\n")
         packages = self.write("p.txt", "package:com.example.a\npackage:com.example.much.longer.name\n")
@@ -247,6 +287,42 @@ class MainTest(MatchCase):
         self.assertEqual("", out)
         self.assertIn("no */debloat*.txt", err)
 
+    def test_an_unreadable_directory_refuses_partial_counts(self):
+        self.add_list("a", "com.example.common\n")
+        hidden = self.add_list("b", "com.example.hidden\n").parent
+        packages = self.write("p.txt", "package:com.example.common\npackage:com.example.hidden\n")
+        real_scandir = os.scandir
+        for denied in (self.examples, hidden):
+            with self.subTest(directory=denied.name):
+                def scandir(path):
+                    if Path(path) == denied:
+                        raise PermissionError(errno.EACCES, "Permission denied", str(denied))
+                    return real_scandir(path)
+
+                with mock.patch.object(os, "scandir", side_effect=scandir):
+                    code, out, err = self.run_main(str(packages), "--examples", str(self.examples))
+                self.assertEqual(2, code, out + err)
+                self.assertEqual("", out, "a partial tally must not be presented as complete")
+                self.assertIn(str(denied), err)
+                self.assertIn("Permission denied", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_a_note_the_console_cannot_encode_is_printed_with_replacement_characters(self):
+        self.add_list("a", "cn.com.wasu.main  # 华数TV\n")
+        packages = self.write("p.txt", "package:cn.com.wasu.main\n")
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="cp1252", newline="")
+        err = io.StringIO()
+        real_stdout = sys.stdout
+        self.addCleanup(setattr, sys, "stdout", real_stdout)
+        sys.stdout = out
+        with redirect_stderr(err):
+            code = match.main([str(packages), "--examples", str(self.examples)])
+        out.flush()
+        self.assertEqual(0, code, err.getvalue())
+        row = raw.getvalue().decode("cp1252").splitlines()[1]
+        self.assertEqual(["cn.com.wasu.main", "1", "0", "??TV"], row.split())
+
     def test_the_default_examples_folder_is_this_checkout(self):
         self.assertEqual(ROOT / "examples", match.EXAMPLES)
 
@@ -263,6 +339,54 @@ class CommandLineTest(MatchCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("com.example.ads", result.stdout)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_package_encodings_produce_the_same_tally(self):
+        self.add_list("a", "com.example.ads  # ads\n# com.example.store  # updates\n"
+                           "com.android.packageinstaller\n")
+        text = ("package:com.example.store\r\npackage:com.example.ads\r\n"
+                "package:com.android.packageinstaller\r\npackage:com.example.ads\r\n")
+        expected = None
+        for encoding, bom in (("utf-8", b""), ("utf-8-sig", b""),
+                              ("utf-16-le", codecs.BOM_UTF16_LE),
+                              ("utf-16-be", codecs.BOM_UTF16_BE)):
+            with self.subTest(encoding=encoding):
+                packages = self.base / "p.txt"
+                original = bom + text.encode(encoding)
+                packages.write_bytes(original)
+                result = self.run_script(str(packages), "--examples", str(self.examples))
+                self.assertEqual(0, result.returncode, result.stderr)
+                if expected is None:
+                    expected = result.stdout
+                self.assertEqual(expected, result.stdout)
+                rows = {line.split()[0]: line.split()[1:] for line in result.stdout.splitlines()[1:]}
+                self.assertEqual(["1", "0", "ads"], rows["com.example.ads"])
+                self.assertEqual(["0", "1", "updates"], rows["com.example.store"])
+                self.assertEqual(["never"], rows["com.android.packageinstaller"])
+                self.assertIn("3 packages, counted over 1 lists", result.stderr)
+                self.assertEqual(original, packages.read_bytes())
+
+    def test_an_empty_examples_path_uses_the_current_directory(self):
+        self.add_list("a", "com.example.ads  # ads\n# com.example.store  # updates\n")
+        self.add_list("b", "com.example.ads  # ads\ncom.example.store  # updates\n")
+        (self.examples / "a" / "debloat-extra.txt").write_text(
+            "com.example.ads  # alternate\ncom.example.extra  # secondary\n", encoding="utf-8")
+        packages = self.write("p.txt", "package:com.example.ads\npackage:com.example.store\n"
+                                       "package:com.example.extra\npackage:com.example.none\n")
+        previous = os.getcwd()
+        try:
+            os.chdir(self.examples)
+            results = [self.run_script(str(packages), "--examples", root) for root in ("", ".")]
+        finally:
+            os.chdir(previous)
+        for result in results:
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("4 packages, counted over 3 lists", result.stderr)
+        self.assertEqual(results[0].stdout, results[1].stdout)
+        rows = {line.split()[0]: line.split()[1:] for line in results[0].stdout.splitlines()[1:]}
+        self.assertEqual({"com.example.ads": ["3", "0", "ads"],
+                          "com.example.extra": ["1", "0", "secondary"],
+                          "com.example.none": ["0", "0"],
+                          "com.example.store": ["1", "1", "updates"]}, rows)
 
     def test_an_unreadable_file_exits_2_without_a_traceback(self):
         result = self.run_script(str(self.base / "gone.txt"), "--examples", str(self.examples))
@@ -292,6 +416,23 @@ class CommandLineTest(MatchCase):
         self.assertEqual(2, result.returncode, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual("", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory permissions are needed")
+    def test_a_directory_without_read_permission_exits_2(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can enumerate a directory without its read permission")
+        self.add_list("a", "com.example.common\n")
+        hidden = self.add_list("b", "com.example.hidden\n").parent
+        packages = self.write("p.txt", "package:com.example.common\npackage:com.example.hidden\n")
+        hidden.chmod(0)
+        try:
+            result = self.run_script(str(packages), "--examples", str(self.examples))
+        finally:
+            hidden.chmod(0o700)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("", result.stdout)
+        self.assertIn(str(hidden), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_the_checkouts_own_examples_are_read_by_default(self):
         packages = self.write("p.txt", "package:com.example.unlikely.to.exist\n")

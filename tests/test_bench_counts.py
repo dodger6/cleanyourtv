@@ -71,7 +71,7 @@ class FakeTV:
     def focused_window(self):
         return "u0 com.gathin.tvhome/.MainActivity"
 
-    def shell(self, command):
+    def shell(self, command, *, retry=False):
         self.commands.append(command)
         if command.startswith("pidof"):
             return "1234\n"
@@ -136,6 +136,12 @@ class RefusedBeforeTheTVTest(unittest.TestCase):
     def test_a_negative_idle_is_refused(self):
         # time.sleep() answers a negative length with ValueError, after the same full run.
         for value in ("-1", "-60"):
+            with self.subTest(idle=value):
+                self.refused(["--idle", value], "--idle", value)
+
+    def test_an_idle_above_a_day_is_refused(self):
+        # time.sleep() answers 10**10 with OverflowError, after the same full run.
+        for value in ("86401", "10000000000"):
             with self.subTest(idle=value):
                 self.refused(["--idle", value], "--idle", value)
 
